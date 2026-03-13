@@ -187,6 +187,67 @@ async function dispatchGitHub(token, repo, payload) {
   }
 }
 
+const BATCH_SIZE = 20;
+
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function buildTodayDispatchUsers(KV, schoolId, today) {
+  const userIds = await getSchoolUsers(KV, schoolId);
+  const users = [];
+  for (const userId of userIds) {
+    const user = await getUser(KV, schoolId, userId);
+    if (!user || user.status !== "active") continue;
+
+    const daySchedule = user.schedule[today];
+    if (!daySchedule || !daySchedule.enabled) continue;
+
+    users.push({
+      username: user.username,
+      password: user.password,
+      roomid: daySchedule.roomid,
+      seatid: daySchedule.seatid.split(",").map(s => s.trim()).filter(Boolean),
+      times: daySchedule.times,
+      seatPageId: daySchedule.seatPageId || "",
+      fidEnc: daySchedule.fidEnc || "",
+      remark: user.remark || user.username,
+    });
+  }
+  return users;
+}
+
+async function dispatchUsersInBatches(env, school, users) {
+  const batches = chunkArray(users, BATCH_SIZE);
+  let okBatches = 0;
+
+  for (let i = 0; i < batches.length; i++) {
+    const payload = {
+      school_id: school.id,
+      school_name: school.name,
+      batch_index: i + 1,
+      batch_total: batches.length,
+      users: batches[i].map(u => ({
+        ...u,
+        endtime: school.endtime,
+        strategy: school.strategy,
+      })),
+    };
+
+    const ok = await dispatchGitHub(env.GH_TOKEN, school.repo, payload);
+    if (ok) okBatches++;
+    console.log(
+      `Dispatch batch ${school.id} ${i + 1}/${batches.length}: ${ok ? "OK" : "FAIL"}`
+    );
+  }
+
+  return { okBatches, totalBatches: batches.length };
+}
+
 // ─── Scheduled Handler ───
 
 async function handleScheduled(env) {
@@ -198,31 +259,12 @@ async function handleScheduled(env) {
     const school = await getSchool(env.SEAT_KV, schoolId);
     if (!school || school.trigger_time !== now) continue;
 
-    const userIds = await getSchoolUsers(env.SEAT_KV, schoolId);
-    for (const userId of userIds) {
-      const user = await getUser(env.SEAT_KV, schoolId, userId);
-      if (!user || user.status !== "active") continue;
-
-      const daySchedule = user.schedule[today];
-      if (!daySchedule || !daySchedule.enabled) continue;
-
-      const payload = {
-        username: user.username,
-        password: user.password,
-        roomid: daySchedule.roomid,
-        seatid: daySchedule.seatid.split(",").map(s => s.trim()).filter(Boolean),
-        times: daySchedule.times,
-        seatPageId: daySchedule.seatPageId || "",
-        fidEnc: daySchedule.fidEnc || "",
-        remark: user.remark || user.username,
-        endtime: school.endtime,
-        strategy: school.strategy,
-      };
-
-      dispatchGitHub(env.GH_TOKEN, school.repo, payload).then(ok => {
-        console.log(`Dispatch ${school.id}/${user.username}: ${ok ? "OK" : "FAIL"}`);
-      });
-    }
+    const users = await buildTodayDispatchUsers(env.SEAT_KV, schoolId, today);
+    if (users.length === 0) continue;
+    const result = await dispatchUsersInBatches(env, school, users);
+    console.log(
+      `Scheduled dispatch school ${school.id}: users=${users.length}, batches=${result.okBatches}/${result.totalBatches}`
+    );
   }
 }
 
@@ -372,29 +414,17 @@ async function handleAPI(request, env, path) {
     const school = await getSchool(KV, schoolId);
     if (!school) return jsonResp({ error: "School not found" }, 404);
     const today = beijingDayOfWeek();
-    const userIds = await getSchoolUsers(KV, schoolId);
-    let triggered = 0;
-    for (const uid of userIds) {
-      const user = await getUser(KV, schoolId, uid);
-      if (!user || user.status !== "active") continue;
-      const daySchedule = user.schedule[today];
-      if (!daySchedule || !daySchedule.enabled) continue;
-      const payload = {
-        username: user.username,
-        password: user.password,
-        roomid: daySchedule.roomid,
-        seatid: daySchedule.seatid.split(",").map(s => s.trim()).filter(Boolean),
-        times: daySchedule.times,
-        seatPageId: daySchedule.seatPageId || "",
-        fidEnc: daySchedule.fidEnc || "",
-        remark: user.remark || user.username,
-        endtime: school.endtime,
-        strategy: school.strategy,
-      };
-      const ok = await dispatchGitHub(env.GH_TOKEN, school.repo, payload);
-      if (ok) triggered++;
+    const users = await buildTodayDispatchUsers(KV, schoolId, today);
+    if (users.length === 0) {
+      return jsonResp({ ok: true, triggeredUsers: 0, okBatches: 0, totalBatches: 0 });
     }
-    return jsonResp({ ok: true, triggered });
+    const result = await dispatchUsersInBatches(env, school, users);
+    return jsonResp({
+      ok: true,
+      triggeredUsers: users.length,
+      okBatches: result.okBatches,
+      totalBatches: result.totalBatches,
+    });
   }
 
   // POST /api/trigger/:schoolId/:userId
@@ -792,7 +822,7 @@ function renderEditSchoolModal() {
           <h4 style="margin:20px 0 12px">策略配置</h4>
           <div class="form-row">
             <div class="form-group">
-              <label>模式 (mode)</label>
+              <label>策略模式（mode）</label>
               <select id="edit_strategy_mode">
                 <option value="A" \${st.mode==="A"?"selected":""}>A - 预取token</option>
                 <option value="B" \${st.mode==="B"?"selected":""}>B - 即时取token</option>
@@ -800,7 +830,7 @@ function renderEditSchoolModal() {
               </select>
             </div>
             <div class="form-group">
-              <label>提交模式</label>
+              <label>提交并发方式（submit_mode）</label>
               <select id="edit_strategy_submit">
                 <option value="serial" \${st.submit_mode==="serial"?"selected":""}>serial - 串行</option>
                 <option value="burst" \${st.submit_mode==="burst"?"selected":""}>burst - 并行</option>
@@ -809,23 +839,46 @@ function renderEditSchoolModal() {
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>login_lead_seconds</label>
+              <label>提前登录秒数（login_lead_seconds）</label>
               <input type="number" id="edit_strategy_login" value="\${st.login_lead_seconds || 14}">
             </div>
             <div class="form-group">
-              <label>slider_lead_seconds</label>
+              <label>提前滑块秒数（slider_lead_seconds）</label>
               <input type="number" id="edit_strategy_slider" value="\${st.slider_lead_seconds || 10}">
             </div>
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>first_submit_offset_ms</label>
+              <label>首枪偏移毫秒（first_submit_offset_ms）</label>
               <input type="number" id="edit_strategy_first" value="\${st.first_submit_offset_ms || 9}">
             </div>
             <div class="form-group">
-              <label>token_fetch_delay_ms</label>
+              <label>取 token 延迟毫秒（token_fetch_delay_ms）</label>
               <input type="number" id="edit_strategy_delay" value="\${st.token_fetch_delay_ms || 45}">
             </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>预取 token 提前毫秒（pre_fetch_token_ms）</label>
+              <input type="number" id="edit_strategy_prefetch" value="\${st.pre_fetch_token_ms || 1531}">
+            </div>
+            <div class="form-group">
+              <label>第二枪目标偏移毫秒（target_offset2_ms）</label>
+              <input type="number" id="edit_strategy_target2" value="\${st.target_offset2_ms || 24}">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>第三枪目标偏移毫秒（target_offset3_ms）</label>
+              <input type="number" id="edit_strategy_target3" value="\${st.target_offset3_ms || 140}">
+            </div>
+            <div class="form-group">
+              <label>并发连发偏移毫秒列表（burst_offsets_ms）</label>
+              <input type="text" id="edit_strategy_burst" value="\${(st.burst_offsets_ms || [120,420,820]).join(',')}" placeholder="例如: 120,420,820">
+            </div>
+          </div>
+          <div style="font-size:12px;color:#666;margin-top:6px">
+            说明：burst_offsets_ms 仅在 submit_mode=burst 时生效，使用英文逗号分隔毫秒值。
           </div>
           <button class="btn btn-primary" onclick="doEditSchool()" style="width:100%;margin-top:16px">保存配置</button>
           <button class="btn btn-danger" onclick="doDeleteSchool()" style="width:100%;margin-top:8px">删除学校</button>
@@ -959,6 +1012,11 @@ function showEditSchool() {
 
 async function doEditSchool() {
   const s = currentSchool;
+  const burstOffsetsText = document.getElementById("edit_strategy_burst").value;
+  const burstOffsets = burstOffsetsText
+    .split(",")
+    .map(v => parseInt(v.trim(), 10))
+    .filter(v => !Number.isNaN(v));
   const body = {
     name: document.getElementById("edit_school_name").value.trim(),
     repo: document.getElementById("edit_school_repo").value.trim(),
@@ -970,8 +1028,12 @@ async function doEditSchool() {
       submit_mode: document.getElementById("edit_strategy_submit").value,
       login_lead_seconds: parseInt(document.getElementById("edit_strategy_login").value) || 14,
       slider_lead_seconds: parseInt(document.getElementById("edit_strategy_slider").value) || 10,
+      pre_fetch_token_ms: parseInt(document.getElementById("edit_strategy_prefetch").value) || 1531,
       first_submit_offset_ms: parseInt(document.getElementById("edit_strategy_first").value) || 9,
+      target_offset2_ms: parseInt(document.getElementById("edit_strategy_target2").value) || 24,
+      target_offset3_ms: parseInt(document.getElementById("edit_strategy_target3").value) || 140,
       token_fetch_delay_ms: parseInt(document.getElementById("edit_strategy_delay").value) || 45,
+      burst_offsets_ms: burstOffsets.length ? burstOffsets : [120, 420, 820],
     }
   };
   const res = await api("PUT", "/api/school/" + s.id, body);
@@ -1000,7 +1062,7 @@ async function triggerSchool() {
   if (!confirm("确定手动触发该学校所有活跃用户？")) return;
   const res = await api("POST", "/api/trigger/" + currentSchool.id);
   if (res.ok) {
-    toast("已触发 " + res.triggered + " 名用户");
+    toast("已触发 " + (res.triggeredUsers || 0) + " 名用户，批次 " + (res.okBatches || 0) + "/" + (res.totalBatches || 0));
   } else {
     toast(res.error || "触发失败", "error");
   }

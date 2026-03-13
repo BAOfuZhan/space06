@@ -1,6 +1,6 @@
 run-name: >-
   Reserve -
-  ${{ github.event.client_payload.remark || github.event.client_payload.username || 'manual' }}
+  ${{ github.event.client_payload.school_id || github.event.client_payload.username || 'manual' }}
 
 on:
   repository_dispatch:
@@ -8,8 +8,27 @@ on:
   workflow_dispatch:        # 允许手动开/关
 
 jobs:
-  reserve:
+  prepare-dispatch:
+    if: ${{ github.event_name == 'repository_dispatch' }}
     runs-on: ubuntu-latest
+    outputs:
+      users_matrix: ${{ steps.build.outputs.users_matrix }}
+    steps:
+      - name: Build user matrix from payload
+        id: build
+        run: |
+          users=$(jq -c '.client_payload.users // [ .client_payload ]' "$GITHUB_EVENT_PATH")
+          echo "users_matrix=$users" >> "$GITHUB_OUTPUT"
+
+  reserve-dispatch:
+    if: ${{ github.event_name == 'repository_dispatch' }}
+    needs: prepare-dispatch
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        user: ${{ fromJson(needs.prepare-dispatch.outputs.users_matrix) }}
 
     steps:
       - name: Checkout repo
@@ -33,15 +52,43 @@ jobs:
         env:
           CX_USERNAME: ${{ secrets.CX_USERNAME }}
           CX_PASSWORD: ${{ secrets.CX_PASSWORD }}
-          DISPATCH_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          DISPATCH_PAYLOAD: ${{ toJson(matrix.user) }}
           TULINGCLOUD_USERNAME: ${{ secrets.TULINGCLOUD_USERNAME }}
           TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
           TULINGCLOUD_MODEL_ID: ${{ secrets.TULINGCLOUD_MODEL_ID }}
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            python main.py --action --dispatch
-          else
-            python main.py --action
-          fi
+          python main.py --action --dispatch
+
+  reserve-manual:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libglib2.0-0
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run reserve script (manual)
+        env:
+          CX_USERNAME: ${{ secrets.CX_USERNAME }}
+          CX_PASSWORD: ${{ secrets.CX_PASSWORD }}
+          TULINGCLOUD_USERNAME: ${{ secrets.TULINGCLOUD_USERNAME }}
+          TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
+          TULINGCLOUD_MODEL_ID: ${{ secrets.TULINGCLOUD_MODEL_ID }}
+        run: |
+          python main.py --action
 
 
